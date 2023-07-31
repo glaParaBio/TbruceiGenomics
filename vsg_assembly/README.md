@@ -46,9 +46,9 @@ create a separate environment and install the project dependencies listed in
 `requirements.txt`:
 
 ```
-mamba create --yes -n 20200508_marija_vsg_assembly
-mamba activate 20200508_marija_vsg_assembly
-mamba install --freeze-installed -n 20200508_marija_vsg_assembly --yes --file requirements.txt
+mamba create --yes -n vsg_assembly
+mamba activate vsg_assembly
+mamba install -n vsg_assembly --yes --file requirements.txt
 ```
 
 Alternatively, install the dependencies in `requirements.txt` manually.
