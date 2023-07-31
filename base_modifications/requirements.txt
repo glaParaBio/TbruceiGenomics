@@ -1,0 +1,14 @@
+snakemake =7.15.2
+samtools =1.14
+minimap2 =2.24
+ont-tombo =1.5.1
+ont_vbz_hdf_plugin =1.0.1
+ont-fast5-api =4.0.0
+ucsc-wigtobigwig =377
+ucsc-bigwigtobedgraph =377
+# numpy <1.20
+# python =3.7.12
+r-data.table =1.14.0
+deeptools
+bedtools =2.30.0
+nanoplot =1.40.2

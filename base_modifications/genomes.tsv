@@ -1,0 +1,4 @@
+genome	fasta
+TriTrypDB-46_TbruceiLister427_2018	https://tritrypdb.org/common/downloads/release-46/TbruceiLister427_2018/fasta/data/TriTrypDB-46_TbruceiLister427_2018_Genome.fasta
+TbruceiLister427_2018	https://tritrypdb.org/common/downloads/release-55/TbruceiLister427_2018/fasta/data/TriTrypDB-55_TbruceiLister427_2018_Genome.fasta
+canu_tb427_ont.contigs_pilon_4x	/export/projects/III-data/wcmp_bioinformatics/db291g/projects/20211218_marija_basej/ref/canu_tb427_ont.contigs_pilon_4x.fasta

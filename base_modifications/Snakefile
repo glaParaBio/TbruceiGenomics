@@ -1,0 +1,439 @@
+import pandas
+import shutil
+import glob
+from pathlib import Path
+import shutil
+import os
+
+from snakemake.remote.HTTP import RemoteProvider as HTTPRemoteProvider
+
+HTTP = HTTPRemoteProvider()
+DETECTION_METHOD=['de_novo', 'level_sample_compare', 'model_sample_compare']
+STRAND=['plus', 'minus']
+
+def get_reference(genomes, genome, HTTP):
+    url = genomes[genomes.genome == genome].fasta.iloc[0]
+    if url.startswith('http'):
+        return HTTP.remote(url, keep_local=True)
+    else:
+        return url
+
+def find_fastq(directory):
+    fx = list(Path(directory).rglob('*.fastq'))
+    gz = list(Path(directory).rglob('*.fastq.gz'))
+    tmp = [re.sub('\.gz$', '', str(x)) for x in gz]
+    if len(fx + tmp) != len(set(fx + tmp)):
+        raise Exception('There are duplicate fastq files (compressed and uncompressed) in directory %s' % directory)
+    return fx + gz
+
+def get_fastq(wc):
+    dat = ss[(ss.genome == wc.genome) & (ss.library_id == wc.library_id) & (pandas.isna(ss.fastq_dir) == False)]
+    fq = []
+    for i, row in dat.iterrows():
+        d = os.path.join(row.run_dir, row.fastq_dir)
+        fx = find_fastq(d)
+        for x in fx:
+            fq.append(os.path.normpath(x))
+    assert len(fq) > 0
+    assert len(fq) == len(set(fq))
+    return sorted(fq)
+
+def resized_bedgraph_output(ss, detection_method, strand, size):
+    template='{genome}/tombo/{detection_method}/browser_files/{library_id}.{file_type}.{strand}.{size}.bedgraph.gz'
+    
+    out=[]
+
+    for d in detection_method:
+        if d == 'de_novo':
+            method_ss = ss[['library_id', 'genome']].drop_duplicates().copy()
+            file_type = 'fraction_modified_reads'
+        elif d == 'model_sample_compare':
+            method_ss = ss[pandas.isnull(ss.control_id) == False][['library_id', 'genome']].drop_duplicates().copy()
+            file_type = 'fraction_modified_reads'
+        elif d == 'level_sample_compare':
+            method_ss = ss[pandas.isnull(ss.control_id) == False][['library_id', 'genome']].drop_duplicates().copy()
+            file_type = 'statistic'
+        else:
+            raise Exception()
+        for idx,row in method_ss.iterrows():
+            for s in strand:
+                out.append(template.format(genome=row.genome, 
+                                           detection_method=d, 
+                                           library_id=row.library_id, 
+                                           file_type=file_type,
+                                           strand=s, size=size))
+    return out
+
+genomes = pandas.read_csv(config['genomes'], sep= '\t', comment= '#')
+ss = pandas.read_csv(config['sample_sheet'], sep= '\t', comment= '#')
+
+
+wildcard_constraints:
+    library_id= '|'.join([re.escape(x) for x in ss.library_id]),
+    genome= '|'.join([re.escape(x) for x in genomes.genome]),
+    detection_method= '|'.join([re.escape(x) for x in DETECTION_METHOD]),
+
+rule all:
+    input:
+        #expand('{genome}/minimap2/{library_id}.bam', zip, genome= ss.genome, library_id= ss.library_id),
+        expand('{genome}/tombo/de_novo/browser_files/{library_id}.coverage.plus.bedgraph.gz', zip, genome= ss.genome, library_id= ss.library_id),
+        expand('{genome}/tombo/level_sample_compare/browser_files/{library_id}.coverage.plus.bedgraph.gz', zip, genome= ss.genome, library_id= ss[pandas.isnull(ss.control_id) == False].library_id),
+        expand('{genome}/tombo/model_sample_compare/browser_files/{library_id}.coverage.plus.bedgraph.gz', zip, genome= ss.genome, library_id= ss[pandas.isnull(ss.control_id) == False].library_id),
+        expand('{genome}/tombo/level_sample_compare/plot_most_significant/{library_id}.mod_vs_ctrl.pdf', zip, genome= ss.genome, library_id= ss[pandas.isnull(ss.control_id) == False].library_id),
+        expand('{genome}/tombo/model_sample_compare/plot_most_significant/{library_id}.mod_vs_ctrl.pdf', zip, genome= ss.genome, library_id= ss[pandas.isnull(ss.control_id) == False].library_id),
+        # resized_bedgraph_output(ss, DETECTION_METHOD, STRAND, 50)
+
+
+rule download_genome:
+    input:
+        fa= lambda wc: get_reference(genomes, wc.genome, HTTP),
+    output:
+        fa= 'ref/{genome}.fasta',
+        fai= 'ref/{genome}.fasta.fai',
+    params:
+        ftp= lambda wc: genomes[genomes.genome == wc.genome].fasta.iloc[0],
+    run:
+        if params.ftp.endswith('.gz'):
+            gunzip = '| gunzip'
+        else:
+            gunzip = ''
+        if params.ftp.startswith('http'):
+            shell(r"""
+                  curl -s -L {params.ftp} %s > {output.fa}
+                  """ % gunzip)
+        else:
+            if gunzip == '':
+                shell('cp {input.fa} {output.fa}')
+            else:
+                shell('gunzip -cd {input.fa} > {output.fa}')
+
+        shell('samtools faidx {output.fa}')
+
+
+rule minimap2:
+    input:
+        ref= 'ref/{genome}.fasta',
+        fq= get_fastq,
+    output:
+        bam= '{genome}/minimap2/{library_id}.bam',
+    run:
+        with open(output.bam + '.files', 'w') as fq:
+            for x in input.fq:
+                fq.write(x + ' ')
+
+        shell(r"""
+            fq=`cat {output.bam}.files`
+            minimap2 --MD -R '@RG\tID:{wildcards.library_id}\tSM:{wildcards.library_id}' -a -x map-ont -t 12 {input.ref} $fq \
+            | samtools sort > {output.bam}
+            samtools index {output.bam}
+            """)
+
+        os.remove(output.bam + '.files')
+
+
+rule merge_nanopore_dirs:
+    # We create a shadow nanopore directory by symlinking the relevant files
+    # from the input dirs
+    input:
+        fast5_dir= set(ss.run_dir + '/' + ss.fast5_dir),
+        seq_sum= set(ss.run_dir + '/' + ss.sequencing_summary),
+        ss = config['sample_sheet'],
+    output:
+        fast5_dir= directory('nanopore/fast5'),
+        seq_sum= 'nanopore/sequencing_summary.tsv',
+    run:
+        os.makedirs(output.fast5_dir)
+
+        ss = pandas.read_csv(config['sample_sheet'], sep= '\t', comment= '#', usecols= ['library_id', 'run_dir', 'sequencing_summary', 'barcode']).drop_duplicates()
+        ss['seq_sum'] = ss.run_dir + '/' + ss.sequencing_summary
+        seq_sum = list()
+        for x in input.seq_sum:
+            tsv = pandas.read_csv(x, sep= '\t', usecols= ['filename', 'read_id', 'barcode_arrangement'])
+            assert x in ss.seq_sum.values
+            tsv = pandas.merge(tsv, ss[ss.seq_sum == x][['library_id', 'barcode']], left_on= 'barcode_arrangement', right_on= 'barcode')
+            tsv.drop(['barcode', 'barcode_arrangement'], axis= 'columns', inplace= True)
+            seq_sum.append(tsv)
+        seq_sum = pandas.concat(seq_sum)
+        seq_sum.to_csv(output.seq_sum, sep= '\t', index= False)
+
+        for d in input.fast5_dir:
+            ff5 = Path(d).rglob('*.fast5')
+            for f5 in ff5:
+                assert os.path.basename(f5) in seq_sum.filename.values
+                dst = os.path.join(output.fast5_dir, os.path.basename(f5))
+                os.symlink(f5, dst)
+        
+
+rule multi_to_single_fast5:
+    # Tombo resquiggles edits the fast5 files in-place so we need to run
+    # multi_to_single_fast5 for each genome
+    input:
+        fast5_dir= 'nanopore/fast5',
+    output:
+        fast5_dir= temp(directory('{genome}/fast5_single')),
+        flist= '{genome}/fast5_single/file_list.txt',
+    shell:
+        r"""
+        multi_to_single_fast5 -i {input.fast5_dir} -s {output.fast5_dir} -t 8
+        find {output.fast5_dir} -type f | sort > {output.flist}
+        """
+
+
+rule split_and_resquiggle_fast5:
+    # We have all reads as separate files in a single directory (with
+    # subdirectories). We use the sequence_summary to know which library each
+    # read belongs to and we move each read to a dedicated library_id
+    # directory. On this library directory we run resquiggles.
+    input:
+        ref= 'ref/{genome}.fasta',
+        fast5_dir= '{genome}/fast5_single',
+        flist= '{genome}/fast5_single/file_list.txt',
+        seq_sum= 'nanopore/sequencing_summary.tsv',
+    output:
+        fast5_dir= temp(directory('{genome}/fast5/{library_id}')),
+    run:
+        seq_sum = pandas.read_csv(input.seq_sum, sep= '\t', usecols= ['read_id', 'library_id'])
+        seq_sum = seq_sum[seq_sum.library_id == wildcards.library_id].reset_index()
+
+        file_list = {}
+        with open(input.flist) as fin:
+            for line in fin:
+                line = line.strip()
+                read_id = re.sub('\.fast5$', '', os.path.basename(line))
+                assert read_id not in file_list
+                file_list[read_id] = line
+
+        for idx,row in seq_sum.iterrows():
+            src = file_list[row.read_id]
+            dir_id = os.path.basename(os.path.dirname(src))
+            int(dir_id)
+            dst = os.path.join(output.fast5_dir, dir_id)
+            os.makedirs(dst, exist_ok= True)
+            shutil.move(src, dst)
+        shell(
+            r"""
+            tombo resquiggle {output.fast5_dir} {input.ref} --processes 12 --num-most-common-errors 20 --include-event-stdev --overwrite
+            """)
+
+
+rule tombo_de_novo:
+    input:
+        fast5_dir= '{genome}/fast5/{library_id}',
+    output:
+        stats= '{genome}/tombo/de_novo/{library_id}.tombo.stats', # NB: The suffix '.tombo.stats' is automatically appended by tombo
+    conda:
+        '../envs/tombo.yaml',
+    shell:
+        r"""
+        base=`echo {output.stats} | sed s/.tombo.stats$//`
+        tombo detect_modifications de_novo \
+            --fast5-basedirs {input.fast5_dir} \
+            --statistics-file-basename ${{base}} \
+            --processes 16
+        """
+
+
+rule model_sample_compare:
+    input:
+        fast5_dir= '{genome}/fast5/{library_id}',
+        ctrl_dir= lambda wc: '{genome}/fast5/%s' % ss[ss.library_id == wc.library_id].control_id.iloc[0],
+    output:
+        stats= '{genome}/tombo/model_sample_compare/{library_id}.tombo.stats', 
+    shell:
+        r"""
+        base=`echo {output.stats} | sed s/.tombo.stats$//`
+        tombo detect_modifications model_sample_compare \
+            --fast5-basedirs {input.fast5_dir} \
+            --statistics-file-basename ${{base}} \
+            --control-fast5-basedirs {input.ctrl_dir} \
+            --processes 16
+        """
+
+
+rule level_sample_compare:
+    input:
+        fast5_dir= '{genome}/fast5/{library_id}',
+        ctrl_dir= lambda wc: '{genome}/fast5/%s' % ss[ss.library_id == wc.library_id].control_id.iloc[0],
+    output:
+        stats= '{genome}/tombo/level_sample_compare/{library_id}.tombo.stats', 
+    shell:
+        r"""
+        base=`echo {output.stats} | sed s/.tombo.stats$//`
+
+        tombo detect_modifications level_sample_compare \
+            --fast5-basedirs {input.fast5_dir} \
+            --statistics-file-basename ${{base}} \
+            --alternate-fast5-basedirs {input.ctrl_dir} \
+            --statistic-type t \
+            --minimum-test-reads 30 \
+            --processes 16
+        """
+
+
+rule sample_compare_plot_most_significant:
+    input:
+        fast5_dir= '{genome}/fast5/{library_id}',
+        ctrl_dir= lambda wc: '{genome}/fast5/%s' % ss[ss.library_id == wc.library_id].control_id.iloc[0],
+        stats= '{genome}/tombo/{detection_method}/{library_id}.tombo.stats', 
+    output:
+        mod= '{genome}/tombo/{detection_method}/plot_most_significant/{library_id}.mod_vs_ctrl.pdf',
+        std= '{genome}/tombo/{detection_method}/plot_most_significant/{library_id}.mod_vs_standard.pdf',
+    shell:
+        r"""
+        tombo plot most_significant \
+            --fast5-basedirs {input.fast5_dir} \
+            --statistics-filename {input.stats} \
+            --control-fast5-basedirs {input.ctrl_dir} \
+            --num-regions 20 \
+            --pdf-filename {output.mod}
+
+        tombo plot most_significant \
+            --fast5-basedirs {input.fast5_dir} \
+            --statistics-filename {input.stats} \
+            --plot-standard-model \
+            --num-regions 20 \
+            --pdf-filename {output.std}
+        """
+
+
+rule de_novo_text_output:
+    input:
+        fast5_dir= '{genome}/fast5/{library_id}',
+        stats= '{genome}/tombo/de_novo/{library_id}.tombo.stats',
+    output:
+        out= '{genome}/tombo/de_novo/browser_files/{library_id}.coverage.plus.bedgraph',
+    params:
+        file_types= ['coverage', 'valid_coverage', 'fraction', 'dampened_fraction', 'statistic'],
+    shell:
+        r"""
+        base=`echo {output.out} | sed s/.coverage.plus.bedgraph$//`
+
+        tombo text_output browser_files \
+            --fast5-basedirs {input.fast5_dir} \
+            --statistics-filename {input.stats} \
+            --browser-file-basename ${{base}} \
+            --file-types {params.file_types}
+        """
+
+
+rule model_sample_compare_text_output:
+    input:
+        fast5_dir= '{genome}/fast5/{library_id}',
+        stats= '{genome}/tombo/model_sample_compare/{library_id}.tombo.stats',
+    output:
+        out= '{genome}/tombo/model_sample_compare/browser_files/{library_id}.coverage.plus.bedgraph',
+    params:
+        file_types= ['coverage', 'valid_coverage', 'fraction', 'dampened_fraction'],
+    shell:
+        r"""
+        base=`echo {output.out} | sed s/.coverage.plus.bedgraph$//`
+
+        tombo text_output browser_files \
+            --fast5-basedirs {input.fast5_dir} \
+            --statistics-filename {input.stats} \
+            --browser-file-basename ${{base}} \
+            --file-types {params.file_types}
+        """
+
+
+rule level_sample_compare_text_output:
+    input:
+        fast5_dir= '{genome}/fast5/{library_id}',
+        stats= '{genome}/tombo/level_sample_compare/{library_id}.tombo.stats',
+    output:
+        out= '{genome}/tombo/level_sample_compare/browser_files/{library_id}.coverage.plus.bedgraph',
+    params:
+        file_types= ['coverage', 'statistic'],
+    shell:
+        r"""
+        base=`echo {output.out} | sed s/.coverage.plus.bedgraph$//`
+
+        tombo text_output browser_files \
+            --fast5-basedirs {input.fast5_dir} \
+            --statistics-filename {input.stats} \
+            --browser-file-basename ${{base}} \
+            --file-types {params.file_types}
+        """
+
+
+rule compress_text_output:
+    input:
+        bdg= '{genome}/tombo/{detection_method}/browser_files/{library_id}.coverage.plus.bedgraph',
+        fai= 'ref/{genome}.fasta.fai',
+    output:
+        bdg= '{genome}/tombo/{detection_method}/browser_files/{library_id}.coverage.plus.bedgraph.gz',
+    run:
+        base = re.sub('.coverage.plus.bedgraph$', '', input.bdg)
+
+        bdgs = glob.glob(base + '*.bedgraph')
+        for bdg in bdgs:
+            cmd = r"""
+            sed 's/^track /#track /' {bdg} | bgzip > {gz}
+            tabix -f -p bed {gz}
+            rm {bdg}
+            """.format(bdg= bdg, gz= bdg + '.gz')
+            shell(cmd)
+
+        wigs = glob.glob(base + '*.wig')
+        for wig in wigs:
+            bigwig = re.sub('\.wig$', '.bw', wig)
+            cmd = r"""
+            wigToBigWig {wig} {fai} {bigwig}
+            rm {wig}""".format(wig= wig, fai= input.fai, bigwig= bigwig)
+            shell(cmd)
+
+
+rule bedtoolsGenomeFile:
+    input:
+        fai='ref/{genome}.fasta.fai',
+    output:
+        genome='ref/{genome}.genome',
+    shell:
+        r"""
+        sort -k1,1 {input.fai} | cut -f 1,2 > {output.genome}
+        """
+
+
+rule resized_bed:
+    input:
+        genome='ref/{genome}.genome',
+    output:
+        bins=temp('ref/{genome}.{size}.bed'),
+    shell:
+        r"""
+        windowMaker -g {input.genome} -w {wildcards.size} > {output.bins}
+        """
+
+
+rule bigWigToBedgraph:
+    input:
+        bw='{genome}/tombo/{detection_method}/browser_files/{library_id}.{file_type}.{strand}.bw',
+    output:
+        bdg=temp('{genome}/tombo/{detection_method}/browser_files/{library_id}.{file_type}.{strand}.bedgraph'),
+    shell:
+        r"""
+        bigWigToBedGraph {input.bw} /dev/stdout \
+        | sort --buffer-size=1G --parallel 8 --stable -k1,1 > {output.bdg}
+        """
+
+
+rule resize_bedgraph:
+    input:
+        bdg='{genome}/tombo/{detection_method}/browser_files/{library_id}.{file_type}.{strand}.bedgraph',
+        genome= 'ref/{genome}.genome',
+        bins='ref/{genome}.{size}.bed',
+    output:
+        bdg='{genome}/tombo/{detection_method}/browser_files/{library_id}.{file_type}.{strand}.{size}.bedgraph.gz',
+    shell:
+        r"""
+        set +o pipefail
+
+        windowMaker -g {input.genome} -w 1 \
+        | intersectBed -nonamecheck -sorted -g {input.genome} -a - -b {input.bdg} -wa -wb \
+        | cut -f 1,2,3,7 \
+        | intersectBed -nonamecheck -sorted -g {input.genome} -a {input.bins} -b - -wa -wb \
+        | cut -f 1,2,3,7 \
+        | groupBy -g 1,2,3 -c 4 -o mean \
+        | bgzip > {output.bdg}
+        tabix -p bed {output.bdg}
+        """
