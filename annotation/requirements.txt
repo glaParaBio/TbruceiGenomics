@@ -1,0 +1,15 @@
+snakemake =7.15.2
+orthofinder =2.5.4
+r-ggplot2 =3.3.6
+r-data.table =1.14.2
+r-argparse =2.1.6
+bioconductor-topgo =2.46.0
+bioconductor-rgraphviz =2.38.0
+
+# Possibly not needed:
+r-ggbeeswarm =0.6.0
+r-ggrepel
+bedtools =2.30.0
+#gffread
+#hisat2
+#samtools

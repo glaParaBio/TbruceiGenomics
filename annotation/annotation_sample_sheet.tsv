@@ -1,0 +1,2 @@
+genome_id	genome_fasta	protein_database	repeatmasker_species	braker_args
+canu_tb427_ont.contigs_pilon_4x	ref/canu_tb427_ont.contigs_pilon_4x.fasta	Euglenozoa	trypanosoma	--augustus_args='--genemodel=intronless'

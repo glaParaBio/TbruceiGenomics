@@ -1,0 +1,64 @@
+import pandas
+
+def get_chroms(fasta):
+    chroms=[]
+    with open(fasta) as fin:
+        for line in fin:
+            if line.startswith('>'):
+                name = line[1:].split()[0]
+                chroms.append(name)
+    return chroms
+
+# ss = pandas.read_csv(config['sample_sheet'], sep='\t', comment='#')
+# 
+# chroms = {}
+# for genome_fasta in set(list(ss.genome_fasta)):
+#     chroms[genome_fasta] = get_chroms(genome_fasta)
+# 
+# wildcard_constraints:
+#     ref_species='|'.join([re.escape(x) for x in ss.ref_species]),
+#     genome_id='|'.join([re.escape(x) for x in ss.genome_id]),
+
+# If you need to prepare GC track
+# ===============================
+#bedtools makewindows -g ref/canu_tb427_ont.contigs_pilon_4x.fasta.fai -w 200 \
+#| bedtools nuc -fi ref/canu_tb427_ont.contigs_pilon_4x.fasta -bed - \
+#| cut -f 1,2,3,5 > ref/canu_tb427_ont.contigs_pilon_4x.pct_gc.bed
+
+
+rule all:
+    input:
+        'topgo/pfam_goterms_intermediate_ctgs.tsv',
+        'results/intermediate_ctgs_vsg.pdf',
+        'results/intermediate_ctgs_domains.tsv',
+
+
+rule topgo:
+    input:
+        gff=config['gff3'],
+        intercontigs=config['intercontigs'],
+    output:
+        tsv='topgo/pfam_goterms_intermediate_ctgs.tsv',
+        rdata=directory('topgo/rdata'),
+    shell:
+        r"""
+        {workflow.basedir}/scripts/pfam_goterms_intermediate_ctgs.r \
+            --gff {input.gff} --intercontigs {input.intercontigs} --tsvout {output.tsv} \
+            --rdata-out {output.rdata}
+        """
+
+
+rule domains:
+    input:
+        gff=config['gff3'],
+        intercontigs=config['intercontigs'],
+        fai=config['fai'],
+    output:
+        vsg='results/intermediate_ctgs_vsg.pdf',
+        doms='results/intermediate_ctgs_domains.tsv',
+    shell:
+        r"""
+        {workflow.basedir}/scripts/vsg_intermediate_ctgs.r --gff {input.gff} --intercontigs {input.intercontigs} \
+            --contigsize {input.fai} \
+            --plotout {output.vsg} --tblout {output.doms}
+        """
