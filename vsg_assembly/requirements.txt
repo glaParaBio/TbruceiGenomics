@@ -1,0 +1,5 @@
+snakemake =7.15.2
+r-data.table =1.12.2
+r-ggplot2 =3.3.0
+blast =2.9.0
+samtools =1.10

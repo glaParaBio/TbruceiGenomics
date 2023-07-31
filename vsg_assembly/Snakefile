@@ -1,0 +1,205 @@
+import pandas
+
+ss = pandas.read_csv(config['ss'], sep= '\t', comment= '#')
+
+wildcard_constraints:
+    asm = '|'.join([re.escape(x) for x in ss.assembly]),
+
+rule all:
+    input:
+        expand('blast/{asm}.vsg.mrg.bed', asm= ss.assembly),
+        expand('blast/{asm}.vsg.bed', asm= ss.assembly),
+        expand(os.path.join(workflow.basedir, 'results/{asm}.vsg.pdf'), asm= ss.assembly),
+
+rule reference:
+    output:
+        cds= 'ref/TriTrypDB-47_TbruceiLister427_2018_AnnotatedCDSs.fasta',
+    shell:
+        r"""
+        curl -s https://tritrypdb.org/common/downloads/release-47/TbruceiLister427_2018/fasta/data/TriTrypDB-47_TbruceiLister427_2018_AnnotatedCDSs.fasta > {output.cds}
+        """
+
+rule extract_vsg:
+    input:
+        cds= 'ref/TriTrypDB-47_TbruceiLister427_2018_AnnotatedCDSs.fasta',
+    output:
+        vsg= 'ref/vsg.fa',
+    shell:
+        # Tb427_000633300.1 and Tb427_000633900.1 are telomeric repeats (wrongly annotated as vsg?)
+        r"""
+        awk -v RS='>' -v FS='\n' -v ORS='' 'NR > 1 && $1 !~ "^Tb427_000633300.1 " && $1 !~ "^Tb427_000633900.1 " && 
+            ($1 ~ "VSG" || $1 ~ "variant surface glycoprotein") {{print ">" $0}}' {input.cds} > {output.vsg}
+        """
+
+rule makeblastdb: 
+    input:
+        fa= lambda wc: ss[ss.assembly == wc.asm].fasta,
+    output:
+        db= 'blastdb/{asm}.nin',
+    shell:
+        r"""
+        makeblastdb -in {input.fa} -dbtype nucl -out `echo {output.db} | sed 's/.nin$//'`
+        """
+
+rule blast:
+    input:
+        query= 'ref/vsg.fa',
+        db= 'blastdb/{asm}.nin',
+    output:
+        out= temp('blast/{asm}.vsg.out'),
+    shell:
+        r"""
+        header="sseqid sstart send qseqid pident sstrand qcovhsp qlen"
+        echo $header | tr ' ' '\t' > {output.out}
+        blastn -query {input.query} \
+                -db `echo {input.db} | sed 's/.nin$//'` \
+                -perc_identity 90 \
+                -qcov_hsp_perc 95 \
+                -outfmt "6 $header" \
+                -dust no \
+                -num_threads 8 >> {output.out}
+        """
+
+rule blastToBed:
+    input:
+        out= 'blast/{asm}.vsg.out',
+    output:
+        bed= 'blast/{asm}.vsg.bed',
+        mrg= 'blast/{asm}.vsg.mrg.bed',
+    shell:
+        r"""
+cat <<'EOF' > {rule}.$$.tmp.R
+library(data.table)
+
+# Merge intervals in data.table x using column names `chrom`, `start`, `end`
+# Return the original data.table with additional columns for merged start and
+# end intervals
+# xx <- data.table(chrom= c(1, 1, 1), start= c(1, 10, 15), end = c(10, 20, 30), id= LETTERS[1:3])
+# mergeOverlaps(xx, 'chrom', 'start', 'end')
+mergeOverlaps <- function(x, chrom, xstart, xend) {{
+    stopifnot(! 'id_' %in% names(x))
+    x2 <- copy(x)
+    x2[, id_ := 1:nrow(x2)]
+    mrg <- x[, c(chrom, xstart, xend), with= FALSE]
+    n <- nrow(mrg)
+    while(TRUE) {{
+        setkeyv(mrg, c(chrom, xstart, xend))
+        mrg[, id_ := 1:nrow(mrg)]
+        mrg <- foverlaps(mrg, mrg, by.x= c(chrom, xstart, xend))
+        mrg <- mrg[, list(xstart= min(get(xstart)), xend= max(get(xend))), by= c(chrom, 'i.id_')]
+        mrg[, i.id_ := NULL]
+        setnames(mrg, c('xstart', 'xend'), c(xstart, xend))
+        mrg <- unique(mrg)
+        if(n == nrow(mrg)) {{
+            break
+        }}
+        n <- nrow(mrg)    
+    }}
+    setkeyv(mrg, c(chrom, xstart, xend))
+    m_start <- sprintf('m.%s', xstart)
+    m_end <- sprintf('m.%s', xend)
+    setnames(mrg, c(xstart, xend), c(m_start, m_end))
+    mrg <- foverlaps(x2, mrg, by.x= c(chrom, xstart, xend))
+    mrg <- mrg[, setNames(.(min(get(m_start)), max(get(m_end))), c(m_start, m_end)), by= names(x2)]
+    stopifnot(identical(x[[xstart]], mrg[[xstart]]))
+    stopifnot(identical(x[[xend]], mrg[[xend]]))
+    mrg[, id_ := NULL]
+    capture.output(print(mrg), file= '/dev/null')
+    return(mrg)
+}}
+
+out <- fread('{input.out}')
+out <- out[order(sseqid, sstart, send)]
+
+# We need to swap sstart and end where strand is minus
+stopifnot(all(out[sstrand == 'minus', send < sstart]))
+stopifnot(all(out[sstrand == 'plus', send > sstart]))
+out[, newstart := ifelse(send < sstart, send, sstart)]
+out[, newend := ifelse(send > sstart, send, sstart)]
+out[, sstart := newstart]
+out[, send := newend]
+out[, newstart := NULL]
+out[, newend := NULL]
+out[, sstart := sstart - 1]
+out[, sstart := as.integer(sstart)]
+out[, send := as.integer(send)]
+
+out[, sstrand := ifelse(sstrand == 'plus', '+', ifelse(sstrand == 'minus', '-', NA))]
+stopifnot(all(!is.na(out$sstrand)))
+
+setcolorder(out, c('sseqid', 'sstart', 'send', 'qseqid', 'pident', 'sstrand'))
+
+setnames(out, 'sseqid', '#sseqid')
+bedout <- mergeOverlaps(out, '#sseqid', 'sstart', 'send')
+bedmrg <- bedout[, list(qseqid= paste(sort(unique(qseqid)), collapse= ','), .N), by= list(`#sseqid`, m.sstart, m.send)]
+
+write.table(bedout, '{output.bed}', sep= '\t', row.names= FALSE, quote= FALSE)
+write.table(bedmrg, '{output.mrg}', sep= '\t', row.names= FALSE, quote= FALSE)
+
+EOF
+Rscript {rule}.$$.tmp.R
+rm {rule}.$$.tmp.R
+        """
+
+rule faidx:
+    input:
+        fa= lambda wc: ss[ss.assembly == wc.asm].fasta,
+    output:
+        done= touch('assembly/{asm}.done'),
+    shell:
+        r"""
+        samtools faidx {input.fa}
+        """
+
+rule plot_vsg:
+    input:
+        vsg= 'blast/{asm}.vsg.mrg.bed',
+        idxdone= 'assembly/{asm}.done',
+    params:
+        fai= lambda wc: ss[ss.assembly == wc.asm].fasta.iloc[0] + '.fai',
+    output:
+        pdf= os.path.join(workflow.basedir, 'results/{asm}.vsg.pdf'), 
+    shell:
+        r"""
+cat <<'EOF' > {rule}.$$.tmp.R
+library(data.table)
+library(ggplot2)
+
+vsg <- fread('{input.vsg}')
+fai <- fread('{params.fai}', select= c(1, 2), col.names= c('contig', 'size'))
+
+setnames(vsg, '#sseqid', 'contig')
+
+stopifnot(all(vsg$contig %in% fai$contig))
+vsg <- merge(vsg, fai, by= 'contig')
+vsg[, N:= NULL]
+vsg <- merge(vsg, vsg[, .N, by= list(contig)], by= c('contig'))
+
+vsg[, contig := sub('(_pilon)+$|_Tb427v9', '', contig)] # Simplify contig names
+xord <- unique(vsg[order(N, -size), contig])
+vsg[, contig := factor(contig, levels= xord)]
+n <- 5
+gg <- ggplot(data= vsg[N > n]) +
+    geom_segment(data= unique(vsg[N > n, list(contig, size)]), aes(x= 0, xend= size/1000, y= contig, yend= contig), colour= 'grey80', size= 3, lineend= 'round') +
+    geom_segment(aes(y= contig, yend= contig, x= m.sstart/1000, xend= m.send/1000), size= 3, colour= 'red') +
+    ylab('') +
+    xlab('Contig size kb') +
+    scale_x_continuous(expand=c(0.01, 0.01)) +
+    ggtitle(sprintf('%s - contigs with > %s VSGs', '{wildcards.asm}', n)) +
+    geom_text(data= vsg[, list(.N, Ncut= sum(N > n), size= max(size))], aes(x= size/1000, y= 0, label= sprintf('Shown: %s/%s', Ncut, N)), hjust= 1, vjust= -1) +
+    theme(
+        panel.grid.major.y= element_blank(),
+        panel.grid.major.x= element_line(size= 0.1, color="grey80", linetype= 'solid'), 
+        panel.grid.minor.x= element_line(size= 0.1, color="grey90", linetype= 'solid'),
+        panel.background= element_rect('white'), 
+        axis.line = element_line(colour = "black"),
+        axis.title.y= element_blank(),
+        axis.line.y= element_blank(),
+        axis.ticks.y= element_blank(),
+        plot.margin= unit(c(0.5, 0.5, 0.5, 1), units= 'cm'))
+ggsave('{output.pdf}', w= 16, h= 24, units= 'cm')
+
+EOF
+Rscript {rule}.$$.tmp.R
+rm {rule}.$$.tmp.R
+        """
